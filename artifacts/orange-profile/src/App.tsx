@@ -236,6 +236,7 @@ function Home() {
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(0.72);
   const [playing, setPlaying] = useState(false);
+  const [isAway, setIsAway] = useState(false);
   const [currentTrack, setCurrentTrack] = useState(MUSIC_TRACKS[0]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -243,6 +244,8 @@ function Home() {
   const [videoOpen, setVideoOpen] = useState(false);
   const [videoMessage, setVideoMessage] = useState('');
   const audioRef = useRef<HTMLAudioElement>(null);
+  const visualizerRef = useRef<HTMLSpanElement>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoCloseRef = useRef<HTMLButtonElement>(null);
   const resumeMusicAfterVideoRef = useRef(false);
@@ -251,6 +254,113 @@ function Home() {
   const musicDrag = useDraggable();
   const socialDrag = useDraggable();
   const aboutDrag = useDraggable();
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    let context: AudioContext | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
+    let analyser: AnalyserNode | null = null;
+    let silentGain: GainNode | null = null;
+
+    const connectVisualizer = () => {
+      if (analyser) return;
+      const media = audio as HTMLAudioElement & {
+        captureStream?: () => MediaStream;
+        mozCaptureStream?: () => MediaStream;
+      };
+      const captureStream = media.captureStream ?? media.mozCaptureStream;
+      if (!captureStream || !window.AudioContext) return;
+
+      try {
+        context = new window.AudioContext();
+        source = context.createMediaStreamSource(captureStream.call(media));
+        analyser = context.createAnalyser();
+        silentGain = context.createGain();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.78;
+        silentGain.gain.value = 0;
+        source.connect(analyser);
+        analyser.connect(silentGain);
+        silentGain.connect(context.destination);
+        analyserRef.current = analyser;
+        void context.resume().catch(() => undefined);
+      } catch {
+        analyserRef.current = null;
+        source?.disconnect();
+        analyser?.disconnect();
+        silentGain?.disconnect();
+        void context?.close();
+      }
+    };
+
+    window.addEventListener('pointerdown', connectVisualizer);
+    window.addEventListener('keydown', connectVisualizer);
+
+    return () => {
+      window.removeEventListener('pointerdown', connectVisualizer);
+      window.removeEventListener('keydown', connectVisualizer);
+      analyserRef.current = null;
+      source?.disconnect();
+      analyser?.disconnect();
+      silentGain?.disconnect();
+      if (context && context.state !== 'closed') void context.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    const visualizer = visualizerRef.current;
+    if (!visualizer) return;
+
+    const bars = Array.from(visualizer.children) as HTMLElement[];
+    const bands: [number, number][] = [[0, 3], [3, 7], [7, 13], [13, 25], [25, 48]];
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let frame = 0;
+    let frequencyData: Uint8Array<ArrayBuffer> | null = null;
+
+    const draw = () => {
+      const audio = audioRef.current;
+      const active = playing && Boolean(audio && !audio.paused && !audio.ended);
+      const analyser = analyserRef.current;
+
+      if (active && audio && !reducedMotion) {
+        if (analyser) {
+          if (!frequencyData || frequencyData.length !== analyser.frequencyBinCount) {
+            frequencyData = new Uint8Array(analyser.frequencyBinCount);
+          }
+          analyser.getByteFrequencyData(frequencyData);
+          bars.forEach((bar, index) => {
+            const [start, end] = bands[index] ?? [0, 1];
+            const rangeEnd = Math.min(end, frequencyData!.length);
+            let total = 0;
+            for (let bin = start; bin < rangeEnd; bin += 1) {
+              total += frequencyData![bin] ?? 0;
+            }
+            const average = total / Math.max(1, rangeEnd - start);
+            const strength = Math.min(1, Math.sqrt(average / 255) * 1.55);
+            bar.style.transform = `scaleY(${0.16 + strength * 0.84})`;
+          });
+        } else {
+          const time = audio.currentTime;
+          const volumeScale = audio.muted ? 0 : audio.volume;
+          bars.forEach((bar, index) => {
+            const wave = (Math.sin(time * (8 + index * 1.7) + index * 1.4) + 1) / 2;
+            bar.style.transform = `scaleY(${0.16 + wave * 0.84 * volumeScale})`;
+          });
+        }
+        frame = window.requestAnimationFrame(draw);
+        return;
+      }
+
+      bars.forEach((bar) => {
+        bar.style.transform = 'scaleY(.16)';
+      });
+    };
+
+    draw();
+    return () => window.cancelAnimationFrame(frame);
+  }, [playing]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -282,6 +392,17 @@ function Home() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [aboutOpen]);
+
+  const profileStatusLabel = isAway
+    ? 'AWAY'
+    : playing
+      ? `LISTENING · ${currentTrack.title}`
+      : 'ONLINE';
+  const profileStatusDescription = isAway
+    ? 'away'
+    : playing
+      ? `listening to ${currentTrack.title}`
+      : 'online';
 
   const togglePlayback = async () => {
     const audio = audioRef.current;
@@ -472,6 +593,17 @@ function Home() {
       >
         <img className="profile-avatar" src={PROFILE_AVATAR} alt={`${PROFILE.username} profile picture`} />
         <span className="profile-name">{PROFILE.username}</span>
+        <button
+          type="button"
+          className="profile-status"
+          aria-pressed={isAway}
+          aria-label={`Status ${profileStatusDescription}. ${isAway ? 'Return to live status' : 'Set status to away'}.`}
+          title={isAway ? 'Click to return to live music status' : 'Click to set status to away'}
+          onClick={() => setIsAway((away) => !away)}
+        >
+          <span className={`profile-status-dot${isAway ? ' is-away' : playing ? ' is-listening' : ''}`} />
+          <span className="profile-status-text">{profileStatusLabel}</span>
+        </button>
       </div>
 
       <section
@@ -515,7 +647,12 @@ function Home() {
           >
             <img className="mini-art" src={currentTrack.cover} alt="" />
             <span className="track-label">
-              <span className="track-title">{currentTrack.title}</span>
+              <span className="track-title-row">
+                <span className="track-title">{currentTrack.title}</span>
+                <span ref={visualizerRef} className={`audio-visualizer${playing ? ' is-active' : ''}`} aria-hidden="true">
+                  <i /><i /><i /><i /><i />
+                </span>
+              </span>
               <span className="track-subtitle">{currentTrack.subtitle}</span>
             </span>
             <ChevronDown className="selector-chevron" size={14} aria-hidden="true" />
